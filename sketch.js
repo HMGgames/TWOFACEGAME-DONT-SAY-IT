@@ -1,23 +1,41 @@
 // ============================
 // DON'T SAY IT — P5 (9:16 virtual + fit-to-screen)
-// Virtual: 540 x 960
-//
-// States: TITLE -> TUTORIAL -> PLAYING -> (WIN / DEFEAT)
-// + "RELEASED" grace window (1s) before DEFEAT:
-//   if player hits INTERRUPT enough during grace => saved.
-//
-// Sound assets:
-// - Button.wav (start + try again button clicks)
-// - Interrupt.wav (interrupt taps)
-// - GameLoop.wav (loops during PLAYING only)
-// - Defeat.wav (on DEFEAT enter)
-// - Victory.wav (on WIN enter)
-//
-// NOTE: requires p5.sound in HTML later.
+// + Difficulty curve (ramps per saved phrase)
+// + Big scoreboard (top-right)
+// + New phrases added
 // ============================
 
 const VW = 540;
 const VH = 960;
+
+// ============================
+// DIFFICULTY KNOBS (tweak these)
+// ============================
+
+// Typing speed (ms per char)
+const DIFF_START_MS = 100;     // frase 1 (más alto = más lento)
+const DIFF_BASE_MS  = 75;      // alrededor de frase 3/4 (tu timing actual)
+const DIFF_MIN_MS   = 30;      // cap mínimo (más bajo = más rápido = más difícil)
+const DIFF_MS_STEP  = 6;       // cuánto baja por frase después del baseline
+
+// Pressure
+const DIFF_START_PRESS = 5.0;  // baseDangerPerSec al inicio
+const DIFF_BASE_PRESS  = 7.0;  // baseDangerPerSec cerca del baseline
+const DIFF_PRESS_STEP  = 0.9;  // cuánto sube por frase luego
+const DIFF_MAX_PRESS   = 16.0;
+
+// Per-character pressure
+const DIFF_START_PERCHAR = 0.22;
+const DIFF_BASE_PERCHAR  = 0.35;
+const DIFF_PERCHAR_STEP  = 0.04;
+const DIFF_MAX_PERCHAR   = 0.95;
+
+// Interrupt effectiveness
+const TAP_RELIEF = 3;          // cuánto baja danger por tap (más alto = más fácil)
+const SUCCESS_RELIEF = 55;     // danger al “salvar” (más alto = más difícil)
+
+const BASELINE_AT = 3;         // en qué frase llegás a DIFF_BASE_* (3 = 3ra/4ta)
+
 
 let g;
 
@@ -136,7 +154,13 @@ function setup() {
     "Our voice is optional. Their rules are not.",
     "Say yes first. Explain later.",
     "If it's unpopular at home, say it abroad.",
-    "We will follow instructions without hesitation."
+    "We will follow instructions without hesitation.",
+
+    // ✅ NEW LINES
+    "They used secret service methods against me.",
+    "Those accusations are clearly… Russian disinformation.",
+    "These drug allegations are fabricated.",
+    "I'm being blackmailed."
   ];
 
   computeFit();
@@ -195,11 +219,7 @@ function draw() {
 function unlockAudioIfNeeded() {
   if (audioUnlocked) return;
   audioUnlocked = true;
-
-  // p5.sound unlock
-  if (typeof userStartAudio === "function") {
-    userStartAudio();
-  }
+  if (typeof userStartAudio === "function") userStartAudio();
 }
 
 function playSnd(snd, vol = 0.9) {
@@ -209,11 +229,11 @@ function playSnd(snd, vol = 0.9) {
 }
 
 function startLoop() {
-  if (!sndLoop || typeof sndLoop.loop !== "function") return;
-  // avoid stacking loops
+  if (!sndLoop || typeof sndLoop.play !== "function") return;
   if (sndLoop.isPlaying && sndLoop.isPlaying()) return;
+  sndLoop.setLoop(true);
   sndLoop.setVolume(0.55);
-  sndLoop.loop();
+  sndLoop.play();
 }
 
 function stopLoop() {
@@ -303,6 +323,9 @@ function renderPlaying(pg, isReleasedMoment) {
 
   // UI (top)
   drawDangerBar(pg);
+
+  // ✅ BIG SCOREBOARD (top-right)
+  drawScoreboard(pg);
 
   // Phrase box (shake text slightly in second half)
   drawPhraseBox(pg, shakeAmt);
@@ -412,13 +435,11 @@ function layoutStartButton() {
   startBtnRect.h = startBtnRect.w * (startBtnImg.height / startBtnImg.width);
   startBtnRect.x = (VW - startBtnRect.w) / 2;
 
-  // moved up to where the hint used to be
   const centerY = VH * 0.90;
   startBtnRect.y = centerY - startBtnRect.h / 2;
 }
 
 function layoutEndButtonSameAsStart() {
-  // Same position and size as Start button
   endBtnRect.w = startBtnRect.w;
   endBtnRect.h = startBtnRect.h;
   endBtnRect.x = startBtnRect.x;
@@ -477,6 +498,30 @@ function drawDangerBar(pg) {
   pg.rect(x, y, w, barH, 12);
 }
 
+// ✅ BIG scoreboard (top-right)
+function drawScoreboard(pg) {
+  pg.push();
+  pg.textAlign(RIGHT, TOP);
+
+  // subtle backplate so it's readable on any BG
+  pg.noStroke();
+  pg.fill(0, 150);
+  pg.rect(VW - 160, 10, 150, 78, 14);
+
+  pg.fill(255, 230);
+  pg.textSize(18);
+  pg.text("SAVED", VW - 20, 18);
+
+  pg.fill(255, 255);
+  pg.textSize(44);
+  pg.text(streak, VW - 20, 36);
+
+  pg.pop();
+
+  // restore defaults
+  pg.textAlign(CENTER, CENTER);
+}
+
 function drawPhraseBox(pg, shakeAmt) {
   const boxW = VW * 0.86;
   const boxH = 130;
@@ -529,11 +574,44 @@ function drawInterruptButton(pg) {
   pg.text("INTERRUPT", btn.x + btn.w / 2, btn.y + btn.h / 2 + 1);
   pg.textStyle(NORMAL);
 
-  // Keep subtle tap indicator (helps UX). If you want it gone, tell me.
+  // keep subtle tap indicator (helps UX)
   pg.fill(255, 180);
   pg.textSize(14);
   pg.text(`${interruptTaps}/${TAPS_TO_INTERRUPT}`, btn.x + btn.w - 30, btn.y - 14);
 }
+
+// ============================
+// Difficulty curve (per saved phrase)
+// ============================
+// Goal:
+// - Phrase #1 slower than before
+// - By phrase #3/#4 ~= current timing
+// - Then progressively faster/harder
+function applyDifficultyCurve() {
+  const s = streak; // frases salvadas
+
+  // 1) typing speed
+  if (s <= BASELINE_AT) {
+    charEveryMs = map(s, 0, BASELINE_AT, DIFF_START_MS, DIFF_BASE_MS);
+  } else {
+    charEveryMs = max(DIFF_MIN_MS, DIFF_BASE_MS - (s - BASELINE_AT) * DIFF_MS_STEP);
+  }
+
+  // 2) base pressure
+  if (s <= BASELINE_AT) {
+    baseDangerPerSec = map(s, 0, BASELINE_AT, DIFF_START_PRESS, DIFF_BASE_PRESS);
+  } else {
+    baseDangerPerSec = min(DIFF_MAX_PRESS, DIFF_BASE_PRESS + (s - BASELINE_AT) * DIFF_PRESS_STEP);
+  }
+
+  // 3) per-char pressure
+  if (s <= BASELINE_AT) {
+    dangerPerChar = map(s, 0, BASELINE_AT, DIFF_START_PERCHAR, DIFF_BASE_PERCHAR);
+  } else {
+    dangerPerChar = min(DIFF_MAX_PERCHAR, DIFF_BASE_PERCHAR + (s - BASELINE_AT) * DIFF_PERCHAR_STEP);
+  }
+}
+
 
 // ============================
 // Phrase logic
@@ -545,10 +623,8 @@ function startNewPhrase() {
   charIndex = 0;
   interruptTaps = 0;
 
-  const s = min(streak, 10);
-  charEveryMs = max(55, 85 - s * 2);
-  baseDangerPerSec = min(14, 7 + s * 0.4);
-  dangerPerChar = min(0.8, 0.35 + s * 0.03);
+  // ✅ Apply the new difficulty curve here
+  applyDifficultyCurve();
 }
 
 function typeNextChar() {
@@ -584,9 +660,7 @@ function startRun() {
   charIndex = 0;
   interruptTaps = 0;
 
-  // stop gameplay loop when leaving
   stopLoop();
-
   state = "TUTORIAL";
 }
 
@@ -597,8 +671,6 @@ function startPlaying() {
   startNewPhrase();
   lastCharAt = millis();
   lastTime = millis();
-
-  // start loop music
   startLoop();
 }
 
@@ -606,11 +678,9 @@ function triggerReleased() {
   state = "RELEASED";
   releasedAt = millis();
   danger = 100;
-  // keep loop running during released moment (more tension)
 }
 
 function triggerDefeat() {
-  // stop loop + play defeat sting
   stopLoop();
   playSnd(sndDefeat, 0.9);
   state = "DEFEAT";
@@ -643,7 +713,7 @@ function applySuccessfulInterrupt() {
 
 function saveFromReleased() {
   state = "PLAYING";
-  danger = 35;
+  danger = SUCCESS_RELIEF;
 
   streak++;
   if (streak >= WIN_STREAK) {
@@ -657,17 +727,14 @@ function saveFromReleased() {
 function interruptNow() {
   if (state !== "PLAYING" && state !== "RELEASED") return;
 
-  // Sound per tap
   playSnd(sndInterrupt, 0.75);
 
   interruptTaps++;
 
-  // tiny relief per tap so it feels responsive
-  danger = max(0, danger - 4);
+  danger = max(0, danger - TAP_RELIEF);
 
   if (interruptTaps < TAPS_TO_INTERRUPT) return;
 
-  // reached threshold
   interruptTaps = 0;
 
   if (state === "RELEASED") {
@@ -685,10 +752,8 @@ function interruptNow() {
 // ============================
 
 function mousePressed() {
-  // Unlock audio on first interaction
   unlockAudioIfNeeded();
 
-  // TITLE
   if (state === "TITLE") {
     layoutStartButton();
     if (isPointerInVirtual(startBtnRect)) {
@@ -698,14 +763,11 @@ function mousePressed() {
     return;
   }
 
-  // TUTORIAL: click anywhere to continue
   if (state === "TUTORIAL") {
-    // start the loop once the player begins
     startPlaying();
     return;
   }
 
-  // WIN / DEFEAT: try again button
   if (state === "WIN" || state === "DEFEAT") {
     layoutStartButton();
     layoutEndButtonSameAsStart();
@@ -716,7 +778,6 @@ function mousePressed() {
     return;
   }
 
-  // PLAYING / RELEASED
   if (state === "PLAYING" || state === "RELEASED") {
     if (isPointerInVirtual(btn)) interruptNow();
     return;
